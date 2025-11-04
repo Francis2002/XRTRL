@@ -9,11 +9,11 @@ if __name__ == "__main__":
 
     parser.add_argument("--gpu", type=str, default="-1", help="which gpu to use")
     parser.add_argument("--USE_WANDB", type=str2bool, default=True, help="log with wandb?")
-    parser.add_argument("--wandb_project", type=str, default="S5", help="wandb project name")
+    parser.add_argument("--wandb_project", type=str, default="XRTRL", help="wandb project name")
     parser.add_argument(
         "--wandb_entity",
         type=str,
-        default="ethz_joao",
+        default="souzaesilva-francis-university-of-lisbon",
         help="wandb entity name, e.g. username",
     )
     parser.add_argument(

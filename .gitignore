@@ -162,3 +162,5 @@ cython_debug/
 
 .vscode/
 wandb/
+raw_datasets/
+raw_data/

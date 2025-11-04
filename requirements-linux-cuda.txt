@@ -1,0 +1,22 @@
+# Keep NumPy 1.x for ABI compatibility with older wheels
+numpy==1.26.4
+scipy==1.11.4
+
+# Torch is not used for GPU in this codebase, so CPU wheels are fine
+torch==2.1.0
+torchvision==0.16.0
+torchaudio==2.1.0
+
+# JAX GPU (Linux). The extra installs the CUDA-built jaxlib.
+jax[cuda12]==0.4.19
+
+# DO NOT pin jaxlib here; the above line pulls the correct CUDA jaxlib for 0.4.19
+
+flax==0.7.1
+chex==0.1.86
+einops==0.8.1
+tensorflow-datasets==4.5.2
+pydub==0.25.1
+datasets==4.4.0
+tqdm==4.67.1
+wandb==0.22.3
