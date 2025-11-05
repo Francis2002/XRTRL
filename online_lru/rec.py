@@ -121,6 +121,7 @@ class LRU(nn.Module):
         if self.training_mode == "online_snap1":
             raise NotImplementedError("SnAp-1 not implemented for LRU")
         assert self.training_mode in [
+            "online_xrtrl",
             "bptt",
             "online_full",
             "online_full_rec",
@@ -190,7 +191,7 @@ class LRU(nn.Module):
                 "traces", "lambda", jnp.zeros, (self.seq_length, self.d_hidden)
             )
 
-            if self.approximation_type in ["full", "snap1", "full_rec_simpleB"]:
+            if self.approximation_type in ["full", "snap1", "full_rec_simpleB", "xrtrl"]:
                 self.traces_B = self.variable(
                     "traces", "B", jnp.zeros, (self.seq_length, self.d_hidden, self.d_model)
                 )
@@ -215,7 +216,7 @@ class LRU(nn.Module):
             if self.approximation_type in ["1truncated"]:
                 self.traces_lambda.value = hidden_states[:-1]
                 self.traces_gamma.value = Bu_elements
-            elif self.approximation_type in ["full", "full_rec", "full_rec_simpleB", "snap1"]:
+            elif self.approximation_type in ["full", "full_rec", "full_rec_simpleB", "snap1", "xrtrl"]:
                 Lambda_elements = jnp.repeat(
                     self.get_diag_lambda()[None, ...], inputs.shape[0], axis=0
                 )

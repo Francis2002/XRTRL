@@ -111,9 +111,10 @@ if __name__ == "__main__":
     parser.add_argument(
         "--training_mode",
         type=str,
-        default="bptt",
+        default="online_xrtrl",
         choices=[
             "bptt",
+            "online_xrtrl",
             "online_full",
             "online_full_rec",
             "online_full_rec_simpleB",

@@ -35,6 +35,21 @@ class StackedEncoder(nn.Module):
     training_mode: str = "bptt"
     prenorm: bool = False
 
+    def _c2r_vec(z):   # (N,) complex -> (2N,) real
+        return jnp.concatenate([jnp.real(z), jnp.imag(z)], axis=-1)
+
+    def _r2c_vec(x):   # (2N,) real -> (N,) complex
+        n = x.shape[-1] // 2
+        return x[:n] + 1j * x[n:]
+
+    def _c2r_cols(Z):  # (N, M) complex columns -> (M, 2N) real
+        return jnp.concatenate([jnp.real(Z).T, jnp.imag(Z).T], axis=-1)
+
+    def _r2c_cols(Y):  # (M, 2H) real -> (H, M) complex (columns)
+        m, twoh = Y.shape
+        h = twoh // 2
+        return (Y[:, :h] + 1j * Y[:, h:]).T
+
     def setup(self):
         """
         Initializes a linear encoder and the stack of SequenceLayer.
@@ -76,18 +91,100 @@ class StackedEncoder(nn.Module):
             x = nn.relu(self.mlp(x))
         return x
 
-    def update_gradients(self, grad):
+    def update_gradients(self, grad, inputs):
         # Update the gradients of encoder
         # NOTE no need to update other gradients as they will be updated through spatial backprop
         if self.training_mode in ["bptt", "online_spatial", "online_reservoir"]:
             raise ValueError("Upgrade gradient should not be called for this training mode")
 
-        for i, layer in enumerate(self.layers[::-1]):
-            name_layer = "layers_%d" % (self.n_layers - i - 1)
-            grad[name_layer] = layer.update_gradients(grad[name_layer])
+        if self.training_mode not in ["online_xrtrl"]:
+            for i, layer in enumerate(self.layers[::-1]):
+                name_layer = "layers_%d" % (self.n_layers - i - 1)
+                grad[name_layer] = layer.update_gradients(grad[name_layer])
+
+            return grad
+
+        # 1) re-run forward per layer to collect h_k[t], x_k[t]
+        #    we reuse our existing modules so weights/masks etc. are identical.
+        inputs = self.encoder(inputs)               # inputs is the model input
+        xs = [inputs]                               # x_0 is the input to the first layer. x is an array of the inputs to the different layers
+        hs = []                                     # list of hidden sequences per layer
+        for i, layer in enumerate(self.layers):
+            inputs_after_pre_seq = layer.pre_seq(xs[-1])            # (T, N)
+            h = layer.seq.get_hidden_states(inputs_after_pre_seq)   # (T, H)
+            y = layer.seq.to_output(inputs_after_pre_seq, h)        # (T, N)
+            x = layer.post_seq_with_cached_dropout(y) + xs[-1]      # (T, N)
+            x = layer.post_skip(x)                                  # (T, N)
+            hs.append(h)
+            xs.append(x)
+
+        deltas = [layer.seq.pert_hidden_states.value for layer in self.layers]  # list of (T, H)
+
+        L = len(self.layers)
+        H = self.layers[0].seq.d_hidden
+
+        # accumulators per layer-ell
+        g_lambda = [jnp.zeros((H,), dtype=jnp.complex64) for _ in range(L)]
+        g_gamma  = [jnp.zeros((H,), dtype=jnp.complex64) for _ in range(L)]
+
+        # 4) for each source ell, stream over time and propagate E^k_{theta_ell}
+        for ell in range(L):
+            # init E^k_t across k=ell..L as zeros at t=0
+            E_lambda = [None]*L
+            E_gamma  = [None]*L
+            for k in range(ell, L):
+                E_lambda[k] = jnp.zeros((H, H), dtype=jnp.complex64)
+                E_gamma[k]  = jnp.zeros((H, H), dtype=jnp.complex64)
+
+            # define time step update
+            def time_step(carry, t):
+                E_lambda, E_gamma, gL, gG = carry
+                # injection at k=ell
+                seq_ell = self.layers[ell].seq
+                Lam_ell = jnp.diag(seq_ell.get_diag_lambda())
+                b_lam = jnp.diag(hs[ell][t-1])                    # Diag(h_ell,t-1)
+                b_gam = jnp.diag(seq_ell.get_B() @ xs[ell][t])  # Diag((B x)_t)
+
+                # k = ell
+                E_lambda[ell] = Lam_ell @ E_lambda[ell] + b_lam
+                E_gamma[ell]  = Lam_ell @ E_gamma[ell]  + b_gam
+
+                # propagate upwards
+                for k in range(ell+1, L):
+                    seq_k = self.layers[k].seq
+                    Lam_k = jnp.diag(seq_k.get_diag_lambda())
+                    E_lambda[k] = Lam_k @ E_lambda[k] + get_cross_layer_contribs(k, t, E_lambda)
+                    E_gamma[k]  = Lam_k @ E_gamma[k]  + get_cross_layer_contribs(k, t, E_gamma)
+                
+                # accumulate sum_{k} {δ_k[t]^T E^k_{theta_ell,t}}
+                acc_lam = 0
+                acc_gam = 0
+                for k in range(ell, L):
+                    acc_lam = acc_lam + deltas[k][t] @ E_lambda[k]
+                    acc_gam = acc_gam + deltas[k][t] @ E_gamma[k]
+                gL = gL + acc_lam
+                gG = gG + acc_gam
+                return (E_lambda, E_gamma, gL, gG), None
+
+            # scan over t=1..T-1 (adapt indices to how you index in your traces)
+            T = xs[0].shape[0]
+            carry = (E_lambda, E_gamma, g_lambda[ell], g_gamma[ell])
+            (E_lambda, E_gamma, g_lambda[ell], g_gamma[ell]), _ = jax.lax.scan(time_step, carry, jnp.arange(1, T))
+
+        # 5) map g_lambda/g_gamma into the actual parameter grads (nu, theta, gamma_log) per layer
+        for ell, layer in enumerate(self.layers):
+            seq = layer.seq
+            # lambda path: VJP through lambda(nu, theta)
+            _, pull = jax.vjp(lambda nu, th: seq.get_diag_lambda(nu=nu, theta=th), seq.nu, seq.theta)
+            dnu, dtheta = pull(g_lambda[ell])
+            grad["encoder"][f"layers_{ell}"]["seq"]["nu"]    = dnu
+            grad["encoder"][f"layers_{ell}"]["seq"]["theta"] = dtheta
+
+            # gamma path
+            if seq.gamma_norm:
+                grad["encoder"][f"layers_{ell}"]["seq"]["gamma_log"] = (g_gamma[ell] * seq.get_diag_gamma()).real
 
         return grad
-
 
 class ClassificationModel(nn.Module):
     """
@@ -215,13 +312,13 @@ class ClassificationModel(nn.Module):
 
         return self.decode(x)
 
-    def update_gradients(self, grad):
+    def update_gradients(self, grad, inputs):
         # Update the gradients of encoder
         # NOTE no need to update other gradients as they will be updated through spatial backprop
         if self.training_mode in ["bptt", "online_spatial", "online_reservoir"]:
             raise ValueError("Upgrade gradient should not be called for this training mode")
 
-        grad["encoder"] = self.encoder.update_gradients(grad["encoder"])
+        grad["encoder"] = self.encoder.update_gradients(grad["encoder"], inputs)
         return grad
 
 
@@ -234,6 +331,7 @@ BatchClassificationModel = nn.vmap(
         "params": None,
         "dropout": None,
         "traces": 0,
+        "cache": 0,
         "perturbations": 0,
     },
     methods=["__call__", "update_gradients"],

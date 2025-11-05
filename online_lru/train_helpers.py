@@ -132,6 +132,7 @@ def create_train_state(
     params = variables["params"]
     init_states = {
         "traces": variables.get("traces"),
+        "cache": variables.get("cache"),
         "perturbations": variables.get("perturbations"),
     }
 
@@ -293,6 +294,9 @@ def state_to_paramsstates(state, init_states, model):
     if not (autodiff_all or autodiff_seq):
         params_states["traces"] = jax.tree_util.tree_map(
             lambda s: jnp.zeros_like(s), init_states["traces"]
+        )
+        params_states["cache"] = jax.tree_util.tree_map(
+            lambda s: jnp.zeros_like(s), init_states["cache"]
         )
         params_states["perturbations"] = jax.tree_util.tree_map(
             lambda s: jnp.zeros_like(s), init_states["perturbations"]
@@ -533,7 +537,7 @@ def batched_average_mask(a, mask):
 
 def compute_grad(params_states, rng, inputs, labels, mask, model):
     def _loss_fn(ps):
-        logits, mod_vars = model.apply(ps, inputs, rngs={"dropout": rng}, mutable=["traces"])
+        logits, mod_vars = model.apply(ps, inputs, rngs={"dropout": rng}, mutable=["traces", "cache"])
         loss = loss_fn(logits, labels, mask)[0]
         return loss, mod_vars
 
@@ -546,13 +550,14 @@ def compute_grad(params_states, rng, inputs, labels, mask, model):
         params_states = {
             "params": params_states["params"],
             "traces": mod_vars["traces"],
+            "cache": mod_vars["cache"],
             "perturbations": grad["perturbations"],
         }
         grads_params = jax.tree_util.tree_map(
             lambda s: jnp.repeat(s[None, :], inputs.shape[0], axis=0) / inputs.shape[0],
             grad["params"],
         )
-        grads = model.apply(params_states, grads_params, method=model.update_gradients)
+        grads = model.apply(params_states, grads_params, inputs, method=model.update_gradients)
         grad = jax.tree_util.tree_map(lambda s: jnp.sum(s, axis=0), grads)
     return loss, grad
 

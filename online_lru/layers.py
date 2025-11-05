@@ -1,6 +1,6 @@
 from flax import linen as nn
 import jax
-
+import jax.numpy as jnp
 
 class SequenceLayer(nn.Module):
     """
@@ -47,6 +47,39 @@ class SequenceLayer(nn.Module):
             deterministic=not self.training,
         )
 
+        if self.training_mode in ['online_xrtrl']:
+            self.dropout_mask_1 = self.variable(
+                    "cache", "dropout_mask_1", jnp.zeros, (self.seq_length, self.d_model)
+                )
+            self.dropout_mask_2 = self.variable(
+                "cache", "dropout_mask_2", jnp.zeros, (self.seq_length, self.d_model)
+            )
+
+    def apply_dropout(self, x, rate: float, name: str,):
+        if rate == 0.0:
+            return x
+        
+        if self.training_mode not in ['online_xrtrl']:
+            return self.drop(x)
+
+        # online xrtrl mode must cache dropout masks!
+        key = self.make_rng("dropout")
+        keep = 1.0 - rate
+        mask = (jax.random.bernoulli(key, keep, shape=x.shape).astype(x.dtype) / keep)
+        # overwrite each forward → no stale or wrong-shape masks
+        if name == "dropout_mask_1":
+            var = self.dropout_mask_1
+        else:
+            var = self.dropout_mask_2
+        var.value = mask
+        return x * mask
+
+    def apply_cached_dropout(self, x, rate: float, var):
+        if rate == 0.0:
+            return x
+
+        return x if var is None else (x * var.value)
+
     def pre_seq(self, x):
         """
         Processing done to the input before calling the recurrent module.
@@ -66,20 +99,50 @@ class SequenceLayer(nn.Module):
             out1 = self.out1
 
         if self.activation in ["full_glu"]:
-            x = self.drop(nn.gelu(x))
+            x = self.apply_dropout(nn.gelu(x), self.dropout, "dropout_mask_1")
             x = out1(x) * jax.nn.sigmoid(out2(x))
-            x = self.drop(x)
+            x = self.apply_dropout(x, self.dropout, "dropout_mask_2")
         elif self.activation in ["half_glu1"]:
-            x = self.drop(nn.gelu(x))
+            x = self.apply_dropout(nn.gelu(x), self.dropout, "dropout_mask_1")
             x = x * jax.nn.sigmoid(out2(x))
-            x = self.drop(x)
+            x = self.apply_dropout(x, self.dropout, "dropout_mask_2")
         elif self.activation in ["half_glu2"]:
             # Only apply GELU to the gate input
-            x1 = self.drop(nn.gelu(x))
+            x1 = self.apply_dropout(nn.gelu(x), self.dropout, "dropout_mask_1")
             x = x * jax.nn.sigmoid(out2(x1))
-            x = self.drop(x)
+            x = self.apply_dropout(x, self.dropout, "dropout_mask_2")
         elif self.activation in ["gelu"]:
-            x = self.drop(nn.gelu(x))
+            x = self.apply_dropout(nn.gelu(x), self.dropout, "dropout_mask_1")
+        elif self.activation in ["none"]:
+            x = x
+        else:
+            raise NotImplementedError("Activation: {} not implemented".format(self.activation))
+        return x
+
+    def post_seq_with_cached_dropout(self, x):
+        """
+        Same as post_seq but using cached dropout masks. For online xrtrl training mode eligibility trace calculation.
+        """
+        if self.activation in ["full_glu", "half_glu1", "half_glu2"]:
+            out2 = self.out2
+        if self.activation in ["full_glu"]:
+            out1 = self.out1
+
+        if self.activation in ["full_glu"]:
+            x = self.apply_cached_dropout(nn.gelu(x), self.dropout, self.dropout_mask_1)
+            x = out1(x) * jax.nn.sigmoid(out2(x))
+            x = self.apply_cached_dropout(x, self.dropout, self.dropout_mask_2)
+        elif self.activation in ["half_glu1"]:
+            x = self.apply_cached_dropout(nn.gelu(x), self.dropout, self.dropout_mask_1)
+            x = x * jax.nn.sigmoid(out2(x))
+            x = self.apply_cached_dropout(x, self.dropout, self.dropout_mask_2)
+        elif self.activation in ["half_glu2"]:
+            # Only apply GELU to the gate input
+            x1 = self.apply_cached_dropout(nn.gelu(x), self.dropout, self.dropout_mask_1)
+            x = x * jax.nn.sigmoid(out2(x1))
+            x = self.apply_cached_dropout(x, self.dropout, self.dropout_mask_2)
+        elif self.activation in ["gelu"]:
+            x = self.apply_cached_dropout(nn.gelu(x), self.dropout, self.dropout_mask_1)
         elif self.activation in ["none"]:
             x = x
         else:
