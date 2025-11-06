@@ -80,6 +80,19 @@ class LRU(nn.Module):
         """
         return self.get_B() * jnp.expand_dims(self.get_diag_gamma(), axis=-1)
 
+    def to_output_at_t(self, inputs_t, hidden_states_t):
+        """
+        Compute output given inputs and hidden states at time t.
+
+        Args:
+            inputs_t array[H].
+            hidden_states_t array[N].
+        """
+        C = self.C_re + 1j * self.C_im
+        D = self.D
+        y_t = (C @ hidden_states_t).real + D * inputs_t
+        return y_t
+    
     def to_output(self, inputs, hidden_states):
         """
         Compute output given inputs and hidden states.
@@ -210,7 +223,8 @@ class LRU(nn.Module):
         output = self.to_output(inputs, hidden_states)
 
         # Compute and update traces if needed (i.e. if we are in online training mode)
-        if self.online and self.approximation_type not in ["spatial", "reservoir"]:
+        # NOTE: XRTRL calculates this on the StackedEncoder
+        if self.online and self.approximation_type not in ["spatial", "reservoir", "xrtrl"]:
             Bu_elements = jax.vmap(lambda u: self.get_B() @ u)(inputs)
             # Update traces for B, lambda and gamma
             if self.approximation_type in ["1truncated"]:

@@ -55,7 +55,7 @@ class SequenceLayer(nn.Module):
                 "cache", "dropout_mask_2", jnp.zeros, (self.seq_length, self.d_model)
             )
 
-    def apply_dropout(self, x, rate: float, name: str,):
+    def apply_dropout(self, x, rate: float, name: str):
         if rate == 0.0:
             return x
         
@@ -79,6 +79,18 @@ class SequenceLayer(nn.Module):
             return x
 
         return x if var is None else (x * var.value)
+    
+    # time-indexed cached dropout (for single-time-step replay)
+    def apply_cached_dropout_at_t(self, x_t, t: int, rate: float, var):
+        if rate == 0.0:
+            return x_t
+
+        if var is None:
+            return x_t
+        
+        mask = var.value  # shape (T, H)
+        mask_t = jax.lax.dynamic_index_in_dim(mask, t, keepdims=False)  # shape (H,)
+        return x_t * mask_t
 
     def pre_seq(self, x):
         """
@@ -143,6 +155,36 @@ class SequenceLayer(nn.Module):
             x = self.apply_cached_dropout(x, self.dropout, self.dropout_mask_2)
         elif self.activation in ["gelu"]:
             x = self.apply_cached_dropout(nn.gelu(x), self.dropout, self.dropout_mask_1)
+        elif self.activation in ["none"]:
+            x = x
+        else:
+            raise NotImplementedError("Activation: {} not implemented".format(self.activation))
+        return x
+    
+    def post_seq_with_cached_dropout_at_t(self, x, t):
+        """
+        Same as post_seq but using cached dropout masks. For online xrtrl training mode eligibility trace calculation.
+        """
+        if self.activation in ["full_glu", "half_glu1", "half_glu2"]:
+            out2 = self.out2
+        if self.activation in ["full_glu"]:
+            out1 = self.out1
+
+        if self.activation in ["full_glu"]:
+            x = self.apply_cached_dropout_at_t(nn.gelu(x), t, self.dropout, self.dropout_mask_1)
+            x = out1(x) * jax.nn.sigmoid(out2(x))
+            x = self.apply_cached_dropout_at_t(x, t, self.dropout, self.dropout_mask_2)
+        elif self.activation in ["half_glu1"]:
+            x = self.apply_cached_dropout_at_t(nn.gelu(x), t, self.dropout, self.dropout_mask_1)
+            x = x * jax.nn.sigmoid(out2(x))
+            x = self.apply_cached_dropout_at_t(x, t, self.dropout, self.dropout_mask_2)
+        elif self.activation in ["half_glu2"]:
+            # Only apply GELU to the gate input
+            x1 = self.apply_cached_dropout_at_t(nn.gelu(x), t, self.dropout, self.dropout_mask_1)
+            x = x * jax.nn.sigmoid(out2(x1))
+            x = self.apply_cached_dropout_at_t(x, t, self.dropout, self.dropout_mask_2)
+        elif self.activation in ["gelu"]:
+            x = self.apply_cached_dropout_at_t(nn.gelu(x), t, self.dropout, self.dropout_mask_1)
         elif self.activation in ["none"]:
             x = x
         else:
