@@ -2,6 +2,8 @@ from functools import partial
 import jax
 import jax.numpy as jnp
 from flax import linen as nn
+
+from online_lru.utils.holomorphic_utils import _get_imag_part_vec, _get_real_part_vec
 from .rec_init import matrix_init, truncated_normal_matrix_init, theta_init, nu_init, gamma_log_init
 from flax.core.frozen_dict import unfreeze
 
@@ -79,6 +81,20 @@ class LRU(nn.Module):
         Get modulated input to hidden matrix gamma B.
         """
         return self.get_B() * jnp.expand_dims(self.get_diag_gamma(), axis=-1)
+    
+    def to_output_at_t_real_aug(self, inputs_t, hidden_states_t):
+        """
+        Compute output given inputs and hidden states at time t, where hidden_states_t is
+        in real-augmented format.
+
+        Args:
+            inputs_t array[H].
+            hidden_states_t array[2N]: [real parts | imag parts]
+        """
+        real_contributions = self.C_re @ _get_real_part_vec(hidden_states_t)
+        imag_contributions = self.C_im @ _get_imag_part_vec(hidden_states_t)
+        y_t = real_contributions - imag_contributions + self.D * inputs_t       # negative sign due to i^2 = -1
+        return y_t
 
     def to_output_at_t(self, inputs_t, hidden_states_t):
         """
@@ -266,7 +282,7 @@ class LRU(nn.Module):
                 ).astype(jnp.complex64)
         return output
 
-    def update_gradients(self, grad):
+    def update_gradients(self, grad, inputs):
         """
         Eventually combine traces and perturbations to compute the (online) gradient.
         """

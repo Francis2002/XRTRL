@@ -87,7 +87,7 @@ class StackedEncoder(nn.Module):
         if self.training_mode not in ["online_xrtrl"]:
             for i, layer in enumerate(self.layers[::-1]):
                 name_layer = "layers_%d" % (self.n_layers - i - 1)
-                grad[name_layer] = layer.update_gradients(grad[name_layer])
+                grad[name_layer] = layer.update_gradients(grad[name_layer], inputs)
 
             return grad
 
@@ -95,9 +95,11 @@ class StackedEncoder(nn.Module):
         #    we reuse our existing modules so weights/masks etc. are identical.
         inputs = self.encoder(inputs)               # inputs is the model input
         xs = [inputs]                               # x_0 is the input to the first layer. x is an array of the inputs to the different layers
+        us = []                                     # list of inputs to the recurrent cores (basically xs after pre_seq)
         hs = []                                     # list of hidden sequences per layer
         for i, layer in enumerate(self.layers):
             inputs_after_pre_seq = layer.pre_seq(xs[-1])            # (T, N)
+            us.append(inputs_after_pre_seq)                         
             h = layer.seq.get_hidden_states(inputs_after_pre_seq)   # (T, H)
             y = layer.seq.to_output(inputs_after_pre_seq, h)        # (T, N)
             x = layer.post_seq_with_cached_dropout(y) + xs[-1]      # (T, N)
@@ -115,7 +117,8 @@ class StackedEncoder(nn.Module):
             pre_seq_k       = self.layers[k].pre_seq
             
             # Take time-slices dynamically (JAX-safe)
-            x_prev_t = _take_t(xs[k],   t)      # (N,)
+            x_prev_t = _take_t(xs[k-1], t)      # (N,)
+            u_prev_t = _take_t(us[k-1], t)      # (N,)
             h_ref    = _take_t(hs[k-1], t)      # (H,)
 
             h0 = _c2r_vec(h_ref) # Convert complex number to real-augmented vector: (H,) complex -> (2H,) real
@@ -124,8 +127,8 @@ class StackedEncoder(nn.Module):
             # recurrent core (not input to layer)
             def from_h_to_x(h_reim):
                 h_c = _r2c_vec(h_reim)                      # Convert to complex to simulate passing through the recurrent core: (2H,) real -> (H,) complex
-                y_prev_t = seq_prev.to_output_at_t(x_prev_t, h_c)
-                z_t = post_seq_prev(y_prev_t, t) + x_prev_t
+                y_prev_t = seq_prev.to_output_at_t(u_prev_t, h_c) # use u_prev_t as input to the recurrent core: (N,)
+                z_t = post_seq_prev(y_prev_t, t) + x_prev_t       # skip connection uses input to the layer x_prev_t: (N,)
                 out = post_skip_prev(z_t)
                 new_x = pre_seq_k(out)
                 return _c2r_vec(new_x)                      # Convert back to real-augmented vector: (N,) complex -> (2N,) real   
@@ -142,12 +145,12 @@ class StackedEncoder(nn.Module):
             return W
 
         def cross_layer_contribs(E_prev, k, t):
-            # E_prev: (N, d2, d3, ...)
+            # E_prev: (H, d2, d3, ...)
             N = E_prev.shape[0]
-            V = E_prev.reshape((N, -1))                      # (N, M), M inferred (JAX-safe)
-            W = _apply_K_to_M_directions(k, t, V)            # (H, M) = S @ V via vmap(jvp)
-            KV = self.layers[k].seq.get_B_norm() @ W         # (N, M) = (γ ⊙ B) @ (S @ V)
-            return KV.reshape(E_prev.shape)                  # back to (N, d2, d3, ...)
+            V = E_prev.reshape((N, -1))                      # (H, M), M inferred (JAX-safe)
+            W = _apply_K_to_M_directions(k, t, V)            # (N, M) = S @ V via vmap(jvp) on from_h_to_x
+            KV = self.layers[k].seq.get_B_norm() @ W         # (H, M) = (γ ⊙ B) @ (S @ V) = (H, N) @ (N, M)
+            return KV.reshape(E_prev.shape)                  # back to (H, d2, d3, ...)
 
         deltas = [layer.seq.pert_hidden_states.value for layer in self.layers]  # list of (T, H)
 
@@ -157,33 +160,41 @@ class StackedEncoder(nn.Module):
         # accumulators per layer-ell
         g_lambda = [jnp.zeros((H,), dtype=jnp.complex64) for _ in range(L)]
         g_gamma  = [jnp.zeros((H,), dtype=jnp.complex64) for _ in range(L)]
+        g_B = [jnp.zeros((H, self.d_model), dtype=jnp.complex64) for _ in range(L)]
 
         # 4) for each source ell, stream over time and propagate E^k_{theta_ell}
         for ell in range(L):
             # init E^k_t across k=ell..L as zeros at t=0
             E_lambda = [None]*L
             E_gamma  = [None]*L
+            E_B      = [None]*L
             for k in range(ell, L):
                 E_lambda[k] = jnp.zeros((H, H), dtype=jnp.complex64)
                 E_gamma[k]  = jnp.zeros((H, H), dtype=jnp.complex64)
+                E_B[k]      = jnp.zeros((H, self.d_model), dtype=jnp.complex64) # For B, we do the Zucchet update, so we dont incurr cubic memory requirements
 
             # define time step update
             def time_step(carry, t):
-                E_lambda, E_gamma, gL, gG = carry
+                E_lambda, E_gamma, E_B, gL, gG, gB = carry
                 # injection at k=ell
                 seq_ell = self.layers[ell].seq
                 Lam_ell = jnp.diag(seq_ell.get_diag_lambda())
 
                 # dynamic time-slices for x_ell[t] and h_ell[t-1] (zero at t=0)
                 x_ell_t   = _take_t(xs[ell], t)                             # (N,)
+                u_ell_t   = _take_t(us[ell], t)                             # (N,)
                 h_ell_tm1 = _take_t_minus_1_or_zero(hs[ell], t, H, hs[ell].dtype)  # (H,)
 
                 b_lam = jnp.diag(h_ell_tm1)                                 # (H,H)
-                b_gam = jnp.diag(seq_ell.get_B() @ x_ell_t)                 # (H,H)
+                b_gam = jnp.diag(seq_ell.get_B() @ u_ell_t)                 # (H,H)
+                b_B   = jnp.outer(seq_ell.get_diag_gamma(), u_ell_t)        # (H,N)
+
+                full_Lambda_ell = jnp.expand_dims(seq_ell.get_diag_lambda(), axis=-1) # (H,1)
 
                 # k = ell
-                E_lambda[ell] = Lam_ell @ E_lambda[ell] + b_lam
-                E_gamma[ell]  = Lam_ell @ E_gamma[ell]  + b_gam
+                E_lambda[ell] = Lam_ell @ E_lambda[ell]     + b_lam
+                E_gamma[ell]  = Lam_ell @ E_gamma[ell]      + b_gam
+                E_B[ell]      = full_Lambda_ell * E_B[ell]  + b_B
 
                 # propagate upwards
                 for k in range(ell+1, L):
@@ -202,12 +213,13 @@ class StackedEncoder(nn.Module):
                     acc_gam = acc_gam + deltas[k][t] @ E_gamma[k]
                 gL = gL + acc_lam
                 gG = gG + acc_gam
-                return (E_lambda, E_gamma, gL, gG), None
+                gB = gB + deltas[ell][t].reshape(-1,1) * E_B[ell]  # Zucchet update
+                return (E_lambda, E_gamma, E_B, gL, gG, gB), None
 
             # scan over t=0..T-1 (adapt indices to how you index in your traces)
             T = xs[0].shape[0]
-            carry = (E_lambda, E_gamma, g_lambda[ell], g_gamma[ell])
-            (E_lambda, E_gamma, g_lambda[ell], g_gamma[ell]), _ = jax.lax.scan(time_step, carry, jnp.arange(T, dtype=jnp.int32))
+            carry = (E_lambda, E_gamma, E_B, g_lambda[ell], g_gamma[ell], g_B[ell])
+            (E_lambda, E_gamma, E_B, g_lambda[ell], g_gamma[ell], g_B[ell]), _ = jax.lax.scan(time_step, carry, jnp.arange(T, dtype=jnp.int32))
 
         # 5) map g_lambda/g_gamma into the actual parameter grads (nu, theta, gamma_log) per layer
         for ell, layer in enumerate(self.layers):
@@ -221,6 +233,10 @@ class StackedEncoder(nn.Module):
             # gamma path
             if seq.gamma_norm:
                 grad[f"layers_{ell}"]["seq"]["gamma_log"] = (g_gamma[ell] * seq.get_diag_gamma()).real
+
+            # B path
+            grad[f"layers_{ell}"]["seq"]["B_re"] = g_B[ell].real
+            grad[f"layers_{ell}"]["seq"]["B_im"] = -g_B[ell].imag   # Comes from the use of Writtinger derivatives
 
         return grad
 

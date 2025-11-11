@@ -295,9 +295,10 @@ def state_to_paramsstates(state, init_states, model):
         params_states["traces"] = jax.tree_util.tree_map(
             lambda s: jnp.zeros_like(s), init_states["traces"]
         )
-        params_states["cache"] = jax.tree_util.tree_map(
-            lambda s: jnp.zeros_like(s), init_states["cache"]
-        )
+        if model.training_mode == "online_xrtrl":
+            params_states["cache"] = jax.tree_util.tree_map(
+                lambda s: jnp.zeros_like(s), init_states["cache"]
+            )
         params_states["perturbations"] = jax.tree_util.tree_map(
             lambda s: jnp.zeros_like(s), init_states["perturbations"]
         )
@@ -547,12 +548,19 @@ def compute_grad(params_states, rng, inputs, labels, mask, model):
     if autodiff_all or autodiff_seq:
         grad = grad["params"]
     else:
-        params_states = {
-            "params": params_states["params"],
-            "traces": mod_vars["traces"],
-            "cache": mod_vars["cache"],
-            "perturbations": grad["perturbations"],
-        }
+        if model.training_mode in ["online_xrtrl"]:
+            params_states = {
+                "params": params_states["params"],
+                "traces": mod_vars["traces"],
+                "cache": mod_vars["cache"],
+                "perturbations": grad["perturbations"],
+            }
+        else:
+            params_states = {
+                "params": params_states["params"],
+                "traces": mod_vars["traces"],
+                "perturbations": grad["perturbations"],
+            }
         grads_params = jax.tree_util.tree_map(
             lambda s: jnp.repeat(s[None, :], inputs.shape[0], axis=0) / inputs.shape[0],
             grad["params"],

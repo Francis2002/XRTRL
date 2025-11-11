@@ -20,6 +20,41 @@ y = jnp.ones((2, base_params["seq_length"]))
 
 mask = jax.numpy.ones((2, 100))
 
+def _round_sig(x, n):
+    x = jnp.asarray(x)
+    absx = jnp.abs(x)
+    is_zero = absx == 0
+    # exponent (floor(log10(abs(x)))) for non-zero entries
+    e = jnp.where(is_zero, 0.0, jnp.floor(jnp.log10(absx)))
+    scale = jnp.power(10.0, (n - 1) - e)
+    rounded = jnp.where(is_zero, 0.0, jnp.round(x * scale) / scale)
+    return rounded
+
+def equal_up_to_n_sigfigs(a, b, n=5):
+    """
+    Compare two pytrees (e.g. dicts) of arrays/scalars up to n significant figures.
+    Returns True if all corresponding leaves are equal after rounding.
+    """
+    try:
+        # ensure same pytree structure / shapes
+        assert_trees_all_equal_shapes(a, b)
+    except Exception:
+        return False
+    
+    # if jnp.all(a == 0) or jnp.all(b == 0):
+    #     return True
+
+    ra = jax.tree_util.tree_map(lambda x: _round_sig(x, n), a)
+    rb = jax.tree_util.tree_map(lambda x: _round_sig(x, n), b)
+
+    leaves_a = jax.tree_util.tree_leaves(ra)
+    leaves_b = jax.tree_util.tree_leaves(rb)
+
+    for xa, xb in zip(leaves_a, leaves_b):
+        if not bool(jnp.all(xa == xb)):
+            return False
+    return True
+
 
 def loss_pred(pred, label, mask=None):
     if mask is None:
@@ -32,6 +67,7 @@ def loss_pred(pred, label, mask=None):
 
 
 def check_grad_all(grad_1, grad_2, to_check=None, **kwargs):
+    test_failed = False
     # Check that the size matches
     assert_trees_all_equal_shapes(grad_1, grad_2)
 
@@ -59,7 +95,18 @@ def check_grad_all(grad_1, grad_2, to_check=None, **kwargs):
         for key in keys:
             val1 = val1[key]
             val2 = val2[key]
-        assert jnp.allclose(val1, val2, **kwargs), "Mismatch at %s" % path
+
+        n_sig = kwargs.get("n_sig_digits", 5)
+
+        try:
+            assert equal_up_to_n_sigfigs(val1, val2, n_sig), "Mismatch at %s\nval1: %s\nval2: %s" % (path, val1, val2)
+        except AssertionError as e:
+            print(e)
+            test_failed = True
+            continue
+
+    if test_failed:
+        raise AssertionError("Gradient check failed.")
 
 
 def compute_grads(model, params_states, inputs, y, mask):

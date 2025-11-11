@@ -55,6 +55,13 @@ class SequenceLayer(nn.Module):
                 "cache", "dropout_mask_2", jnp.zeros, (self.seq_length, self.d_model)
             )
 
+    def run_seq(self, z):
+        """
+        Run the recurrent module over the whole sequence.
+        Used to expose the recurrent core for testing purposes.
+        """
+        return self.seq(z)
+
     def apply_dropout(self, x, rate: float, name: str):
         if rate == 0.0:
             return x
@@ -206,11 +213,11 @@ class SequenceLayer(nn.Module):
         hiddens_post_skip = inputs + self.post_seq(hiddens_post_seq)
         return self.post_skip(hiddens_post_skip)
 
-    def update_gradients(self, grad):
+    def update_gradients(self, grad, inputs):
         # Update the gradients of the recurrent module
         # NOTE no need to update other gradients as they will be updated through spatial backprop
         if self.training_mode in ["bptt", "online_spatial", "online_reservoir"]:
             raise ValueError("Upgrade gradient should not be called for this training mode")
 
-        grad["seq"] = self.seq.update_gradients(grad["seq"])
+        grad["seq"] = self.seq.update_gradients(grad["seq"], inputs)
         return grad
